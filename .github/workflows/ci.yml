@@ -1,0 +1,109 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.9"
+  GOLANGCI_LINT_IMAGE: "golangci/golangci-lint:v2.9.0"
+
+jobs:
+  check:
+    name: format, vet, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Lint
+        run: |
+          docker run --rm -v "$PWD":/src -w /src \
+            "$GOLANGCI_LINT_IMAGE" golangci-lint run ./...
+
+      - name: Test with the race detector
+        run: go test -race ./...
+
+  against-real-service:
+    name: run against a real installment ledger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check out the service under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: vamsi513/installment-ledger
+          path: service
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      - name: Start Postgres
+        working-directory: service
+        run: docker compose up -d
+
+      - name: Install the service and migrate
+        working-directory: service
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --requirement requirements.txt
+          for attempt in $(seq 1 30); do
+            if .venv/bin/alembic upgrade head; then exit 0; fi
+            echo "database not ready yet, attempt $attempt"
+            sleep 2
+          done
+          echo "the database never became ready"
+          exit 1
+
+      - name: Start the service
+        working-directory: service
+        run: |
+          # nohup so the service outlives this step's shell.
+          nohup .venv/bin/uvicorn app.main:app \
+            --host 127.0.0.1 --port 8000 --log-level warning \
+            > uvicorn.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:8000/health; then
+              echo
+              echo "service is healthy"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the service never became healthy, its log follows"
+          cat uvicorn.log
+          exit 1
+
+      - name: Run the load tester
+        run: go run ./cmd/ledger-loadtest -base-url http://127.0.0.1:8000 -workers 16 -duration 15s
